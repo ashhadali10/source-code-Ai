@@ -1,0 +1,256 @@
+import sys
+import json
+import hashlib
+import logging
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List
+
+from database import DatabaseManager
+from ai_validator import AIValidator
+from utils import run_command, tool_installed
+from report_generator import ReportGenerator
+
+logger = logging.getLogger(__name__)
+
+
+def extract_code_window(file_path: str, center_line: int, window: int = 50) -> str:
+    """Extract ~100 lines around the vulnerability."""
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            lines = f.readlines()
+
+        start = max(0, center_line - window - 1)
+        end = min(len(lines), center_line + window)
+
+        numbered = []
+        for i in range(start, end):
+            marker = ">>>" if (i + 1) == center_line else "   "
+            numbered.append(f"{marker} {i+1:4d} | {lines[i].rstrip()}")
+
+        return "\n".join(numbered)
+    except Exception as e:
+        return f"[Error reading file: {e}]"
+
+
+def run_semgrep_on_file(file_path: str, line_start: int, line_end: int) -> List[Dict]:
+    """Run Semgrep on a specific file, filter results to line range."""
+    if not tool_installed("semgrep"):
+        return []
+
+    cmd = [
+        "semgrep", "scan",
+        "--config", "p/owasp-top-ten",
+        "--config", "p/secrets",
+        "--json", "--quiet",
+        "--no-git-ignore",
+        "--disable-version-check",
+        file_path,
+    ]
+
+    result = run_command(cmd, timeout=300)
+    if not result or result["returncode"] not in (0, 1):
+        return []
+
+    try:
+        data = json.loads(result["stdout"])
+    except json.JSONDecodeError:
+        return []
+
+    findings = []
+    for f in data.get("results", []):
+        start = f.get("start", {}).get("line", 0)
+        if not (line_start - 10 <= start <= line_end + 10):
+            continue
+        extra = f.get("extra", {}) or {}
+        findings.append({
+            "rule_id": f.get("check_id", ""),
+            "severity": extra.get("severity", "INFO"),
+            "message": extra.get("message", ""),
+            "line": start,
+        })
+    return findings
+
+
+def validate_single_finding(finding: Dict, validator: AIValidator,
+                            use_semgrep: bool = True) -> Dict:
+    """Validate one finding: extract code, run semgrep, ask AI."""
+
+    file_path = finding.get("absolute_path", "")
+    line = finding.get("line", 0)
+
+    if not Path(file_path).exists():
+        return {
+            "verdict": "NEEDS_REVIEW",
+            "confidence": "LOW",
+            "reason": f"File not found: {file_path}",
+            "remediation": "",
+            "evidence": "",
+            "semgrep_findings": [],
+        }
+
+    new_code = extract_code_window(file_path, line, window=50)
+
+    semgrep_result = []
+    if use_semgrep:
+        semgrep_result = run_semgrep_on_file(file_path, line - 10, line + 10)
+
+    old_code = finding.get("evidence", "No historical code available")
+
+    static_still_vulnerable = len(semgrep_result) > 0
+
+    result = validator.validate_fix(
+        finding,
+        old_code,
+        new_code,
+        static_still_vulnerable=static_still_vulnerable
+    )
+
+    return {
+        "verdict": result.get("result", "NEEDS_REVIEW"),
+        "confidence": result.get("confidence", "LOW"),
+        "reason": result.get("reason", ""),
+        "remediation": "",
+        "evidence": result.get("changes_detected", []),
+        "semgrep_findings": semgrep_result,
+    }
+
+
+def cmd_validate(args, config: Dict):
+    db = DatabaseManager(config["database"]["path"])
+    validator = AIValidator(config["llm"])
+
+    # args.target is now a LIST (nargs='+' in main.py)
+    targets = args.target if isinstance(args.target, list) else [args.target]
+
+    # Separate finding IDs from file paths
+    finding_ids = []
+    file_paths = []
+
+    for t in targets:
+        # Support comma-separated too: "FIND-A,FIND-B"
+        parts = [x.strip() for x in t.replace(",", " ").split() if x.strip()]
+        for p in parts:
+            if p.startswith("FIND-"):
+                finding_ids.append(p)
+            else:
+                file_paths.append(p)
+
+    findings = []
+
+    if finding_ids:
+        findings.extend(db.get_findings_for_validation(finding_ids=finding_ids))
+
+    for fp in file_paths:
+        rows = db.get_findings_for_validation(file_path=fp)
+        findings.extend(rows)
+
+    # If nothing found, show available
+    if not findings:
+        logger.warning("No open findings found for the specified target(s).")
+        print("\nAvailable findings:")
+        conn = db._get_conn()
+        cursor = conn.execute(
+            "SELECT finding_id, severity, relative_path, line "
+            "FROM findings WHERE status IN "
+            "('NEW','OPEN','PARTIALLY_FIXED','NOT_FIXED','REGRESSION') "
+            "LIMIT 30"
+        )
+        for r in cursor.fetchall():
+            print(f"  {r['finding_id']} | {r['severity']} | {r['relative_path']}:{r['line']}")
+        conn.close()
+        sys.exit(0)
+
+    # Deduplicate findings
+    seen = set()
+    unique_findings = []
+    for f in findings:
+        fid = f.get("finding_id")
+        if fid and fid not in seen:
+            seen.add(fid)
+            unique_findings.append(f)
+    findings = unique_findings
+
+    logger.info(f"Validating {len(findings)} finding(s)...")
+    print()
+
+    results = []
+    for i, f in enumerate(findings, 1):
+        fid = f.get("finding_id", "?")
+        rel = f.get("relative_path", "")
+        line = f.get("line", 0)
+
+        print(f"[{i}/{len(findings)}] {fid}")
+        print(f"    File: {rel}:{line}")
+        print(f"    Rule: {f.get('rule_id', '')}")
+
+        result = validate_single_finding(f, validator, use_semgrep=True)
+
+        validation_data = {
+            "old_code": f.get("evidence", ""),
+            "new_code": result.get("evidence", ""),
+            "old_hash": f.get("version_hash", ""),
+            "new_hash": hashlib.sha256(
+                json.dumps(result.get("evidence", [])).encode()
+            ).hexdigest(),
+            "result": result["verdict"],
+            "confidence": result["confidence"],
+            "reason": result["reason"],
+        }
+        db.record_validation(fid, validation_data)
+
+        print(f"    → {result['verdict']} ({result['confidence']})")
+        print(f"    Reason: {result['reason'][:150]}...")
+        if result["semgrep_findings"]:
+            print(f"    Semgrep in new code: {len(result['semgrep_findings'])} finding(s)")
+        print()
+
+        results.append({
+            **f,
+            "validation_result": result["verdict"],
+            "validation_confidence": result["confidence"],
+            "validation_reason": result["reason"],
+            "validation_evidence": result.get("evidence", []),
+            "semgrep_findings": result["semgrep_findings"],
+            "ai_verdict": result["verdict"],
+            "ai_confidence": result["confidence"],
+            "ai_reason": result["reason"],
+            "ai_remediation": "",
+        })
+
+    # Summary
+    fixed = sum(1 for r in results if r["validation_result"] == "FIXED")
+    partial = sum(1 for r in results if r["validation_result"] == "PARTIALLY_FIXED")
+    not_fixed = sum(1 for r in results if r["validation_result"] == "NOT_FIXED")
+    regression = sum(1 for r in results if r["validation_result"] == "REGRESSION")
+
+    print("=" * 60)
+    print(f"FIXED:          {fixed}")
+    print(f"PARTIALLY:      {partial}")
+    print(f"NOT FIXED:      {not_fixed}")
+    print(f"REGRESSION:     {regression}")
+    print("=" * 60)
+    print()
+
+    report_path = ReportGenerator.generate(
+        {
+            "scan_info": {
+                "scan_id": f"VALIDATION-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+                "project_path": ", ".join(targets),
+                "model_name": config["llm"].get("model", ""),
+            },
+            "findings": results,
+            "history": [],
+            "stats": {
+                "total": len(results),
+                "critical": sum(1 for r in results if r.get("severity") == "CRITICAL"),
+                "high": sum(1 for r in results if r.get("severity") == "HIGH"),
+                "medium": sum(1 for r in results if r.get("severity") == "MEDIUM"),
+                "true_positives": fixed,
+                "false_positives": not_fixed,
+            },
+        },
+        config["reporting"]["output_dir"],
+        "VALIDATION",
+    )
+    print(f"✅ Validation complete. Report: {report_path}/index.html")

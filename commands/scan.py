@@ -1,0 +1,202 @@
+# secscanner/commands/scan.py
+"""Scan command — AI mode configurable (finder / reviewer / both)."""
+
+import sys
+import json
+import hashlib
+import logging
+from pathlib import Path
+from typing import Dict
+
+from database import DatabaseManager
+from utils import get_target_files, extract_security_context
+from engines.semgrep_engine import SemgrepEngine
+from engines.hadolint_engine import HadolintEngine
+from engines.gitleaks_engine import GitleaksEngine
+from engines.trivy_engine import TrivyEngine
+from ai_validator import AIValidator
+from ai_file_reviewer import AIFileReviewer
+from report_generator import ReportGenerator
+
+logger = logging.getLogger(__name__)
+
+
+def cmd_scan(args, config: Dict):
+    target = Path(args.target).resolve()
+    if not target.exists():
+        logger.error(f"Target path does not exist: {target}")
+        sys.exit(3)
+
+    print("\n" + "=" * 50)
+    print(" PROFESSIONAL SOURCE-CODE SECURITY SCANNER")
+    print("=" * 50 + "\n")
+
+    db = DatabaseManager(config["database"]["path"])
+    proj_id = db.get_or_create_project(str(target))
+    llm_models = config["llm"].get("models") or [config["llm"].get("model", "")]
+    scan_id = db.create_scan(
+        proj_id,
+        ", ".join(llm_models),
+        hashlib.sha256(json.dumps(config, default=str).encode()).hexdigest()[:16]
+    )
+
+    # ═══════════════════════════════════════════════
+    # AI MODE CONFIG
+    # ═══════════════════════════════════════════════
+    ai_mode = config.get("ai_mode", {}) or {}
+    ai_finder_enabled = bool(ai_mode.get("vulnerability_finder", False))
+    ai_reviewer_enabled = bool(ai_mode.get("finding_reviewer", False))
+
+    # ai_mode is the single source of truth for AI behavior
+    # (do NOT let ai_code_review.enabled override it)
+
+    logger.info(f"AI Mode: vulnerability_finder={ai_finder_enabled}, "
+                f"finding_reviewer={ai_reviewer_enabled}")
+
+    # ───────────────────────────────────────────────
+    # [1/5] FILE DISCOVERY
+    # ───────────────────────────────────────────────
+    logger.info("[1/5] File Discovery")
+    logger.info("-" * 40)
+    files = get_target_files(str(target))
+    logger.info(f"Found {len(files)} eligible files for scanning.")
+    logger.info("-" * 40 + "\n")
+
+    all_findings = []
+
+    # ───────────────────────────────────────────────
+    # [2/5] SEMGREP (always runs)
+    # ───────────────────────────────────────────────
+    if config["tools"].get("semgrep", True):
+        all_findings.extend(SemgrepEngine(files).run())
+
+    # ───────────────────────────────────────────────
+    # [3/5] AI VULNERABILITY FINDER (optional)
+    # ───────────────────────────────────────────────
+    ai_review_stats = {}
+    if ai_finder_enabled:
+        logger.info("[3/5] AI Vulnerability Finder")
+        logger.info("-" * 40)
+        reviewer = AIFileReviewer(config)
+        selected_files = reviewer.select_files(files)
+
+        eligible_count = sum(
+            1 for f in files
+            if AIFileReviewer.count_lines(str(f)) <= reviewer.max_file_lines
+        )
+
+        ai_review_stats = {
+            "eligible": eligible_count,
+            "selected": len(selected_files),
+            "total_lines_reviewed": sum(lines for _, lines, _ in selected_files),
+            "max_budget": reviewer.max_total_lines,
+            "skipped": eligible_count - len(selected_files),
+            "highest_priority": [f[0].name for f in selected_files[:5]],
+        }
+
+        if selected_files:
+            logger.info(f"Budget: {ai_review_stats['total_lines_reviewed']} / "
+                        f"{ai_review_stats['max_budget']} lines used")
+            logger.info(f"Selected {len(selected_files)} high-priority files.")
+            logger.info("Status: RUNNING...")
+            ai_findings = reviewer.review_files(selected_files)
+            logger.info(f"Status: COMPLETED")
+            logger.info(f"Findings: {len(ai_findings)}")
+            all_findings.extend(ai_findings)
+        else:
+            logger.info("Status: SKIPPED (No files met priority/budget criteria)")
+        logger.info("-" * 40 + "\n")
+    else:
+        logger.info("[3/5] AI Vulnerability Finder: DISABLED (config)")
+        logger.info("-" * 40 + "\n")
+
+    # ───────────────────────────────────────────────
+    # [4/5] OTHER SCANNERS
+    # ───────────────────────────────────────────────
+    logger.info("[4/5] Additional Scanners (Hadolint, Gitleaks, Trivy)")
+    logger.info("-" * 40)
+    if config["tools"].get("hadolint", True):
+        all_findings.extend(HadolintEngine(files).run())
+    if config["tools"].get("gitleaks", True):
+        all_findings.extend(GitleaksEngine(str(target)).run())
+    if config["tools"].get("trivy", True):
+        all_findings.extend(TrivyEngine(str(target)).run())
+    logger.info("-" * 40 + "\n")
+
+    # ───────────────────────────────────────────────
+    # [5/5] AI VALIDATION (optional)
+    # ───────────────────────────────────────────────
+    logger.info("[5/5] AI Vulnerability Validation & Reporting")
+    logger.info("-" * 40)
+
+    enriched = []
+    for f in all_findings:
+        if f.get("tool") == "ai_file_review":
+            enriched.append(f)  # Already has full file as evidence
+        else:
+            ctx = extract_security_context(f["absolute_path"], f["line"])
+            f["evidence"] = ctx["snippet"]
+            enriched.append(f)
+
+    if ai_reviewer_enabled:
+        validator = AIValidator(config["llm"])
+        logger.info(f"Validating {len(enriched)} findings with LLM...")
+        validated = validator.validate_batch(enriched)
+    else:
+        logger.info("AI Finding Reviewer: DISABLED (config)")
+        logger.info("Skipping LLM validation — using raw tool findings.")
+        # Still normalize fields so report works
+        validated = []
+        for f in enriched:
+            f.setdefault("ai_verdict", "NEEDS_REVIEW")
+            f.setdefault("ai_confidence", "N/A")
+            f.setdefault("ai_reason", "")
+            f.setdefault("ai_remediation", "")
+            f.setdefault("ai_severity", f.get("severity", "INFO"))
+            f.setdefault("ai_review_status", "SKIPPED")
+            f.setdefault("llm_model", "N/A")
+            validated.append(f)
+
+    for f in validated:
+        db.upsert_finding(f, proj_id, scan_id)
+
+    conn = db._get_conn()
+    conn.execute(
+        "UPDATE scans SET status='COMPLETED', completed_at=CURRENT_TIMESTAMP, "
+        "files_scanned=?, finding_count=? WHERE scan_id=?",
+        (len(files), len(validated), scan_id)
+    )
+    conn.commit()
+    conn.close()
+
+    scan_data = db.get_scan_data(scan_id)
+    scan_data["ai_review_stats"] = ai_review_stats
+    scan_data["ai_mode"] = {
+        "vulnerability_finder": ai_finder_enabled,
+        "finding_reviewer": ai_reviewer_enabled,
+    }
+
+    report_path = ReportGenerator.generate(
+        scan_data,
+        config["reporting"]["output_dir"],
+        "SCAN"
+    )
+
+    tp_high = [
+        f for f in validated
+        if f.get('ai_verdict') == 'TRUE_POSITIVE'
+        and f.get('severity') in ['CRITICAL', 'HIGH']
+    ]
+
+    print("\n" + "=" * 50)
+    print(" SCAN COMPLETED SUCCESSFULLY")
+    print("=" * 50)
+    print(f"Scan ID:       {scan_id}")
+    print(f"Files Scanned: {len(files)}")
+    print(f"AI Mode:       finder={ai_finder_enabled}, reviewer={ai_reviewer_enabled}")
+    print(f"Total Finding: {len(validated)} ({len(tp_high)} HIGH/CRITICAL true positives)")
+    print(f"HTML Report:   {report_path}/index.html")
+    print(f"Database:      {config['database']['path']}")
+    print("=" * 50 + "\n")
+
+    sys.exit(0 if len(tp_high) == 0 else 1)

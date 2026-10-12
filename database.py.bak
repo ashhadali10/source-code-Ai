@@ -1,0 +1,395 @@
+import os
+import re
+import json
+import hashlib
+import sqlite3
+from pathlib import Path
+from datetime import datetime
+from typing import Dict, List, Any, Optional
+
+
+class DatabaseManager:
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        os.makedirs(os.path.dirname(os.path.abspath(db_path)), exist_ok=True)
+        self._init_db()
+
+    def _get_conn(self):
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+
+    def _init_db(self):
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        cursor.executescript("""
+            CREATE TABLE IF NOT EXISTS projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_name TEXT,
+                project_path TEXT UNIQUE,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE IF NOT EXISTS scans (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                scan_id TEXT UNIQUE,
+                project_id INTEGER,
+                started_at TIMESTAMP,
+                completed_at TIMESTAMP,
+                status TEXT,
+                scanner_version TEXT,
+                config_hash TEXT,
+                model_name TEXT,
+                files_scanned INTEGER,
+                finding_count INTEGER,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            );
+            CREATE TABLE IF NOT EXISTS files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_id INTEGER,
+                relative_path TEXT,
+                absolute_path TEXT,
+                language TEXT,
+                sha256 TEXT,
+                first_seen TIMESTAMP,
+                last_seen TIMESTAMP,
+                UNIQUE(project_id, relative_path)
+            );
+            CREATE TABLE IF NOT EXISTS findings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                finding_id TEXT UNIQUE,
+                project_id INTEGER,
+                stable_id TEXT,
+                version_hash TEXT,
+                title TEXT,
+                severity TEXT,
+                confidence TEXT,
+                language TEXT,
+                relative_path TEXT,
+                absolute_path TEXT,
+                line INTEGER,
+                column INTEGER,
+                tool TEXT,
+                rule_id TEXT,
+                cwe TEXT,
+                owasp TEXT,
+                description TEXT,
+                evidence TEXT,
+                source TEXT,
+                sink TEXT,
+                sanitization TEXT,
+                ai_verdict TEXT,
+                ai_confidence TEXT,
+                ai_reason TEXT,
+                ai_remediation TEXT,
+                status TEXT,
+                first_seen TIMESTAMP,
+                last_seen TIMESTAMP,
+                resolved_at TIMESTAMP,
+                FOREIGN KEY (project_id) REFERENCES projects(id)
+            );
+            CREATE TABLE IF NOT EXISTS finding_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                finding_id TEXT,
+                scan_id TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                event_type TEXT,
+                old_status TEXT,
+                new_status TEXT,
+                old_hash TEXT,
+                new_hash TEXT,
+                details TEXT
+            );
+            CREATE TABLE IF NOT EXISTS validations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                finding_id TEXT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                validation_type TEXT,
+                old_code TEXT,
+                new_code TEXT,
+                old_hash TEXT,
+                new_hash TEXT,
+                result TEXT,
+                confidence TEXT,
+                reason TEXT
+            );
+        """)
+        conn.commit()
+        conn.close()
+
+    # ────────────────────────────────────────────────────
+    # PROJECTS
+    # ────────────────────────────────────────────────────
+
+    def get_or_create_project(self, path: str) -> int:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        p = Path(path).resolve()
+        if p.is_file():
+            p = p.parent
+        abs_path = str(p)
+        cursor.execute("SELECT id FROM projects WHERE project_path = ?", (abs_path,))
+        row = cursor.fetchone()
+        if row:
+            proj_id = row['id']
+            cursor.execute("UPDATE projects SET updated_at = CURRENT_TIMESTAMP WHERE id = ?", (proj_id,))
+        else:
+            cursor.execute(
+                "INSERT INTO projects (project_name, project_path) VALUES (?, ?)",
+                (Path(abs_path).name, abs_path)
+            )
+            proj_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return proj_id
+
+    # ────────────────────────────────────────────────────
+    # SCANS
+    # ────────────────────────────────────────────────────
+
+    def create_scan(self, project_id: int, model_name: str, config_hash: str) -> str:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+        scan_id = f"SCAN-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        cursor.execute("""
+            INSERT INTO scans (scan_id, project_id, started_at, status, model_name, config_hash, files_scanned, finding_count)
+            VALUES (?, ?, CURRENT_TIMESTAMP, 'RUNNING', ?, ?, 0, 0)
+        """, (scan_id, project_id, model_name, config_hash))
+        conn.commit()
+        conn.close()
+        return scan_id
+
+    # ────────────────────────────────────────────────────
+    # FINDINGS
+    # ────────────────────────────────────────────────────
+
+    def upsert_finding(self, finding: Dict, project_id: int, scan_id: str) -> str:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        clean_evidence = re.sub(
+            r'^\s*(?:>>>|\s*\d+\s*\|)\s*', '',
+            str(finding.get('evidence', '')),
+            flags=re.MULTILINE
+        )
+        clean_evidence = "".join(clean_evidence.split())
+
+        stable_id = hashlib.sha256(
+            f"{finding.get('absolute_path', finding['relative_path'])}:{finding['rule_id']}:{finding.get('cwe', '')}".encode()
+        ).hexdigest()[:16]
+        version_hash = hashlib.sha256(f"{stable_id}:{clean_evidence}".encode()).hexdigest()
+        finding_id = f"FIND-{stable_id.upper()}"
+
+        cursor.execute(
+            "SELECT id, status, version_hash FROM findings WHERE stable_id = ? AND project_id = ?",
+            (stable_id, project_id)
+        )
+        existing = cursor.fetchone()
+
+        now = datetime.now().isoformat()
+
+        if existing:
+            old_status = existing['status'] or 'NEW'
+            old_hash = existing['version_hash']
+            if old_hash == version_hash:
+                event_type = 'UNCHANGED'
+                new_status = old_status
+                cursor.execute("UPDATE findings SET last_seen = ? WHERE id = ?", (now, existing['id']))
+            else:
+                event_type = 'CHANGED'
+                new_status = 'OPEN' if old_status in ['NEW', 'OPEN', 'POTENTIALLY_FIXED'] else old_status
+                cursor.execute("""
+                    UPDATE findings SET version_hash=?, severity=?, confidence=?, relative_path=?, absolute_path=?,
+                    line=?, column=?, tool=?, rule_id=?, cwe=?, owasp=?, description=?, evidence=?,
+                    ai_verdict=?, ai_confidence=?, ai_reason=?, ai_remediation=?, status=?, last_seen=?
+                    WHERE id=?
+                """, (
+                    version_hash, finding['severity'], finding.get('confidence', 'MEDIUM'),
+                    finding['relative_path'], finding['absolute_path'], finding['line'],
+                    finding.get('column', 0), finding['tool'], finding['rule_id'],
+                    str(finding.get('cwe', 'Unknown')), str(finding.get('owasp', 'Unknown')),
+                    finding.get('description', ''), finding.get('evidence', ''),
+                    finding.get('ai_verdict', 'NEEDS_REVIEW'),
+                    finding.get('ai_confidence', 'LOW'), finding.get('ai_reason', ''),
+                    finding.get('ai_remediation', ''), new_status, now, existing['id']
+                ))
+        else:
+            event_type = 'NEW'
+            new_status = 'NEW'
+            cursor.execute("""
+                INSERT OR REPLACE INTO findings (
+                    finding_id, project_id, stable_id, version_hash, title, severity, confidence,
+                    language, relative_path, absolute_path, line, column, tool, rule_id, cwe, owasp,
+                    description, evidence, source, sink, sanitization, ai_verdict, ai_confidence,
+                    ai_reason, ai_remediation, status, first_seen, last_seen
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                finding_id, project_id, stable_id, version_hash,
+                finding.get('message', 'Security Finding'), finding['severity'],
+                finding.get('confidence', 'MEDIUM'), finding.get('language', 'unknown'),
+                finding['relative_path'], finding['absolute_path'], finding['line'],
+                finding.get('column', 0), finding['tool'], finding['rule_id'],
+                str(finding.get('cwe', 'Unknown')), str(finding.get('owasp', 'Unknown')),
+                finding.get('message', ''), finding.get('evidence', ''),
+                finding.get('source', 'Unknown'), finding.get('sink', 'Unknown'),
+                finding.get('sanitization', 'None'),
+                finding.get('ai_verdict', 'NEEDS_REVIEW'),
+                finding.get('ai_confidence', 'LOW'),
+                finding.get('ai_reason', ''), finding.get('ai_remediation', ''),
+                new_status, now, now
+            ))
+
+        cursor.execute("""
+            INSERT INTO finding_history (finding_id, scan_id, event_type, old_status, new_status, old_hash, new_hash, details)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            finding_id, scan_id, event_type,
+            existing['status'] if existing else None, new_status,
+            existing['version_hash'] if existing else None,
+            version_hash, finding.get('message', '')
+        ))
+
+        conn.commit()
+        conn.close()
+        return finding_id
+
+    def get_findings_for_validation(
+        self,
+        finding_ids: List[str] = None,
+        finding_id: str = None,
+        file_path: str = None
+    ) -> List[Dict]:
+        """Fetch findings for validation.
+
+        Priority:
+          1. finding_ids (list) — multiple specific findings
+          2. finding_id (single) — one specific finding
+          3. file_path — all findings for a file
+          4. (none) — all open findings
+        """
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        ACTIVE_STATUSES = (
+            'NEW', 'OPEN', 'POTENTIALLY_FIXED', 'CONFIRMED',
+            'NOT_FIXED', 'PARTIALLY_FIXED', 'REGRESSION'
+        )
+        placeholders = ','.join(['?'] * len(ACTIVE_STATUSES))
+
+        if finding_ids:
+            qmarks = ','.join(['?'] * len(finding_ids))
+            cursor.execute(
+                f"SELECT * FROM findings WHERE finding_id IN ({qmarks})",
+                tuple(finding_ids)
+            )
+        elif finding_id:
+            cursor.execute("SELECT * FROM findings WHERE finding_id = ?", (finding_id,))
+        elif file_path:
+            abs_path = str(Path(file_path).resolve())
+            rel_path = str(Path(file_path))
+            cursor.execute(f"""
+                SELECT * FROM findings
+                WHERE (absolute_path = ? OR relative_path = ? OR absolute_path LIKE ?)
+                AND status IN ({placeholders})
+            """, (abs_path, rel_path, f"%{rel_path}%", *ACTIVE_STATUSES))
+        else:
+            cursor.execute(f"""
+                SELECT * FROM findings
+                WHERE status IN ({placeholders})
+            """, ACTIVE_STATUSES)
+
+        results = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return results
+
+    # ────────────────────────────────────────────────────
+    # VALIDATIONS
+    # ────────────────────────────────────────────────────
+
+    def record_validation(self, finding_id: str, validation_data: Dict):
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            INSERT INTO validations (
+                finding_id, validation_type, old_code, new_code,
+                old_hash, new_hash, result, confidence, reason
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            finding_id, 'REVALIDATION',
+            validation_data.get('old_code'),
+            validation_data.get('new_code'),
+            validation_data.get('old_hash'),
+            validation_data.get('new_hash'),
+            validation_data.get('result'),
+            validation_data.get('confidence'),
+            validation_data.get('reason')
+        ))
+
+        new_status = validation_data.get('result')
+        if new_status == 'FIXED':
+            cursor.execute(
+                "UPDATE findings SET status = 'RESOLVED', resolved_at = CURRENT_TIMESTAMP WHERE finding_id = ?",
+                (finding_id,)
+            )
+        elif new_status in ['PARTIALLY_FIXED', 'NOT_FIXED', 'REGRESSION']:
+            cursor.execute(
+                "UPDATE findings SET status = ? WHERE finding_id = ?",
+                (new_status, finding_id)
+            )
+
+        conn.commit()
+        conn.close()
+
+    # ────────────────────────────────────────────────────
+    # REPORTS
+    # ────────────────────────────────────────────────────
+
+    def get_scan_data(self, scan_id: str) -> Dict:
+        conn = self._get_conn()
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT * FROM scans WHERE scan_id = ?", (scan_id,))
+        scan = dict(cursor.fetchone() or {})
+
+        cursor.execute(
+            "SELECT * FROM findings WHERE project_id = (SELECT project_id FROM scans WHERE scan_id = ?)",
+            (scan_id,)
+        )
+        findings = [dict(row) for row in cursor.fetchall()]
+
+        cursor.execute("""
+            SELECT * FROM finding_history
+            WHERE scan_id = ?
+            OR finding_id IN (
+                SELECT finding_id FROM findings
+                WHERE project_id = (SELECT project_id FROM scans WHERE scan_id = ?)
+            )
+        """, (scan_id, scan_id))
+        history = [dict(row) for row in cursor.fetchall()]
+
+        cursor.execute("SELECT project_path FROM projects WHERE id = ?", (scan.get('project_id'),))
+        proj_row = cursor.fetchone()
+
+        conn.close()
+
+        return {
+            "scan_info": {
+                **scan,
+                "project_path": proj_row['project_path'] if proj_row else "Unknown"
+            },
+            "findings": findings,
+            "history": history,
+            "stats": {
+                "total": len(findings),
+                "critical": sum(1 for f in findings if f['severity'] == 'CRITICAL'),
+                "high": sum(1 for f in findings if f['severity'] == 'HIGH'),
+                "medium": sum(1 for f in findings if f['severity'] == 'MEDIUM'),
+                "low": sum(1 for f in findings if f['severity'] == 'LOW'),
+                "true_positives": sum(1 for f in findings if f.get('ai_verdict') == 'TRUE_POSITIVE'),
+                "false_positives": sum(1 for f in findings if f.get('ai_verdict') == 'FALSE_POSITIVE'),
+                "resolved": sum(1 for f in findings if f.get('status') == 'RESOLVED'),
+            }
+        }

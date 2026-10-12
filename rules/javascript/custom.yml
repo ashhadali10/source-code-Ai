@@ -1,0 +1,32 @@
+rules:
+  - id: js-child-process-exec
+    languages: [javascript]
+    severity: ERROR
+    message: Dangerous command execution detected. Use execFile or spawn with an argument array instead of exec.
+    pattern-either:
+      - pattern: child_process.exec(...)
+      - pattern: child_process.execSync(...)
+    metadata:
+      severity: HIGH
+      cwe: CWE-78
+      owasp: A03:2021
+
+  - id: js-eval-request-input
+    languages: [javascript]
+    severity: ERROR
+    message: eval or new Function reached by request data - remote code execution risk.
+    pattern-regex: "(\\beval\\s*\\(|new\\s+Function\\s*\\()[^)\\n]{0,120}\\breq\\s*\\."
+    metadata:
+      severity: CRITICAL
+      cwe: CWE-95
+      owasp: A03:2021
+
+  - id: js-prototype-pollution
+    languages: [javascript]
+    severity: WARNING
+    message: Potential prototype pollution or mass-assignment via object merge with user-controlled data.
+    pattern-regex: "Object\\.(?:assign|merge)\\s*\\([^)\\n]{0,120}\\breq\\.body"
+    metadata:
+      severity: MEDIUM
+      cwe: CWE-1321
+      owasp: A03:2021

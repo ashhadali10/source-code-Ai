@@ -1,0 +1,22 @@
+rules:
+  - id: js-hardcoded-fallback-secret
+    languages:
+      - javascript
+      - typescript
+    severity: CRITICAL
+    message: Hardcoded fallback secret detected. If the environment variable is missing, a hardcoded string is used, exposing sensitive credentials.
+    pattern-either:
+      - patterns:
+        - pattern: $VAR = process.env.$ENV || $FALLBACK
+        - metavariable-regex:
+            metavariable: $FALLBACK
+            regex: ^["'].*["']$
+      - patterns:
+        - pattern: $VAR = process.env.$ENV ? process.env.$ENV : $FALLBACK
+        - metavariable-regex:
+            metavariable: $FALLBACK
+            regex: ^["'].*["']$
+    metadata:
+      cwe: CWE-798
+      owasp: A07:2021
+      category: security

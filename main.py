@@ -1,0 +1,72 @@
+import sys
+import argparse
+import logging
+from pathlib import Path
+
+from rules_loader import setup_environment
+from config import load_config
+from commands.scan import cmd_scan
+from commands.validate import cmd_validate
+from commands.history import cmd_history
+from commands.export import cmd_export
+from commands.tools import cmd_tools
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+logger = logging.getLogger(__name__)
+
+
+def main():
+    setup_environment()
+
+    parser = argparse.ArgumentParser(
+        description="Professional Local Source-Code Security Scanner"
+    )
+    parser.add_argument("--config", default="config.yaml", help="Path to config.yaml")
+
+    subparsers = parser.add_subparsers(dest="command", help="Available commands")
+
+    scan_p = subparsers.add_parser("scan", help="Scan a project directory")
+    scan_p.add_argument("target", help="Path to project or file")
+
+    val_p = subparsers.add_parser(
+        "validate",
+        help="Validate specific findings or files"
+    )
+    val_p.add_argument(
+        "target",
+        nargs='+',
+        help="One or more Finding IDs (e.g., FIND-00023) or file paths"
+    )
+
+    hist_p = subparsers.add_parser("history", help="View scan history")
+    hist_p.add_argument("finding_id", nargs="?", help="Specific finding ID")
+
+    exp_p = subparsers.add_parser("export", help="Export a specific scan")
+    exp_p.add_argument("scan_id", help="Scan ID to export")
+
+    subparsers.add_parser("tools", help="Check installed security tools")
+    subparsers.add_parser("config", help="Show current configuration")
+
+    args = parser.parse_args()
+
+    if not args.command or args.command == "config":
+        print(Path("config.yaml").read_text(encoding="utf-8"))
+        sys.exit(0)
+
+    config = load_config(args.config)
+
+    commands = {
+        "scan": cmd_scan,
+        "validate": cmd_validate,
+        "history": cmd_history,
+        "export": cmd_export,
+        "tools": cmd_tools,
+    }
+
+    handler = commands.get(args.command)
+    if handler:
+        handler(args, config)
+
+
+if __name__ == "__main__":
+    main()
